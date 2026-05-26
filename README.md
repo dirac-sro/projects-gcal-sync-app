@@ -47,21 +47,52 @@ ship. Check **first**:
    calendar.** Confirm in [calendar.google.com](https://calendar.google.com) that the personal
    calendar appears under *Other calendars*. ⚠️ Until you accept the share, the Apps Script API will
    return `404` for that calendar ID.
-3. **Work account** — [script.google.com](https://script.google.com) → New project → paste in
-   `Code.gs` and `appsscript.json` from this repo (or `clasp push`).
+3. **Work account** — [script.google.com](https://script.google.com) → *New project*. Rename to
+   `gcal-sync-app`. Then pick one path:
+
+   **A) Manual (recommended first time):**
+   - *Project Settings* (gear icon, left rail) → tick **"Show 'appsscript.json' manifest file"** →
+     this makes the manifest visible in the editor.
+   - Back in the editor: delete the default `function myFunction() { … }`, paste in the contents of
+     `Code.gs` from this repo. Open the now-visible `appsscript.json` and replace its contents with
+     the manifest from this repo.
+
+   **B) Via [`clasp`](https://github.com/google/clasp):**
+   - `npm i -g @google/clasp`
+   - `clasp login` (sign in with the work account)
+   - In this repo dir: `clasp create --type standalone --title gcal-sync-app --rootDir .` →
+     `clasp push`
+   - You still have to enable the Calendar API in the editor (next step) — `clasp` won't do it.
 4. **Editor → Services → +** → enable **Calendar API (v3)**.
 5. Edit the `CONFIG` block at the top of `Code.gs`:
    - `PERSONAL_CAL_ID` = your personal email (the calendar ID you copied).
    - `WORK_CAL_ID` stays `'primary'` (script writes to the work account's own primary calendar).
    - `TZ` matches `appsscript.json#timeZone` (both default to `Europe/Bratislava`).
    - `WORK_START_HOUR`, `WORK_END_HOUR`, `HORIZON_DAYS` as you like.
-6. Run `initialSetup()` once → grant OAuth scopes → it installs the every-1-min trigger and runs the
-   first reconcile. *(If you have a huge backlog of future events, lower `HORIZON_DAYS` to 14 for
-   the first run — the rolling window will catch up over the next day.)*
+6. Run `initialSetup()` once: in the editor toolbar, **select `initialSetup` from the function
+   dropdown** next to the *Run* button, save (Ctrl/Cmd-S), then click *Run*. Grant the OAuth scopes
+   when prompted. It installs the every-1-min trigger and runs the first reconcile.
 7. **Failure notifications** — Apps Script editor → Triggers (clock icon, left rail) → on the
    `runSync` trigger row, *Edit* → *Failure notification settings* → **Notify me immediately**. The
    trigger auto-disables after repeated failures (typically if you revoke the share or hit auth
    issues), and you want to know.
+
+## Troubleshooting first run
+
+- **`Attempted to execute myFunction, but it was deleted`** — the *Run* button executes whichever
+  function is selected in the toolbar dropdown, and it's still pointing at the deleted default.
+  Pick `initialSetup` from the dropdown next to *Run*; save first (Ctrl/Cmd-S), otherwise newly
+  added functions don't show up.
+- **`Script timezone X does not match CONFIG.TZ Y`** — `assertTzMatches()` fires on purpose; segment
+  math and date keys must agree. Fix one of:
+  - Apps Script editor → *Project Settings* (gear, left rail) → *Time zone* → match `CONFIG.TZ`, or
+  - Edit `appsscript.json#timeZone` **and** `CONFIG.TZ` to name the same TZ.
+  (`Europe/Prague` and `Europe/Bratislava` are functionally identical — same offset, same DST.)
+- **First `initialSetup()` with `HORIZON_DAYS=90` runs slow / risks the 6-min hard limit** — start
+  with `HORIZON_DAYS: 14`, run `initialSetup()` (fast), then bump back to `90` and run `runSync()`
+  manually. The budget-aware reconcile + 1-min trigger fills the rest over the next few minutes.
+- **`Not Found` / 404 on `Calendar.Events.list`** — the personal calendar share hasn't been
+  accepted in the work account yet. See Setup step 2.
 
 ## Verify (do all of these once)
 
