@@ -1,10 +1,11 @@
 /** ---------- CONFIG ---------- */
 const CONFIG = {
-  PERSONAL_CAL_ID:    'your.personal@gmail.com', // shared INTO the work account ("See all event details") + accepted
-  WORK_CAL_ID:        'primary',                  // the work calendar this script account owns
-  SHARED_CAL_ID:      '',                         // OPTIONAL: team OOO calendar. Empty = solo mode (no shared writes).
-  OWNER_DISPLAY_NAME: '',                         // REQUIRED if SHARED_CAL_ID set. e.g. 'Adam Pagac' → 'OOO - Adam Pagac'
-  TZ:                 'Europe/Bratislava',         // must match appsscript.json "timeZone"
+  PERSONAL_CAL_ID:    'your.personal@gmail.com',   // shared INTO the work account ("See all event details") + accepted
+  WORK_CAL_ID:        'primary',                   // the work calendar this script account owns
+  OWNER_EMAIL:        'your.work@email.com',       // your work email — used as a stable key to tag your managed blocks. Required.
+  SHARED_CAL_ID:      '',                          // OPTIONAL: team OOO calendar. Empty = solo mode (no shared writes).
+  OWNER_DISPLAY_NAME: 'YOUR NAME',                 // REQUIRED if SHARED_CAL_ID set. e.g. 'Adam Pagac' → 'OOO - Adam Pagac'
+  TZ:                 'Europe/Prague',             // must match appsscript.json "timeZone"
   WORK_START_HOUR:    8,
   WORK_END_HOUR:      18,
   HORIZON_DAYS:       90,                          // rolling window (~3 months forward)
@@ -13,21 +14,17 @@ const CONFIG = {
   RUN_BUDGET_MS:      5 * 60 * 1000,               // leave ~1 min headroom under the 6-min hard limit
 };
 
-const PROP_OWNER_EMAIL = 'pcalOwnerEmail';
-
-/** Run ONCE manually (and again after any CONFIG change): validates, captures owner email,
- *  migrates legacy blocks to tagged-by-owner form, installs the trigger, runs first reconcile. */
+/** Run ONCE manually (and again after any CONFIG change): validates, migrates legacy blocks
+ *  to tagged-by-owner form, installs the trigger, runs first reconcile. */
 function initialSetup() {
   assertTzMatches();
+  if (!CONFIG.OWNER_EMAIL) {
+    throw new Error('OWNER_EMAIL is empty — set it to your work email in CONFIG.');
+  }
   if (CONFIG.SHARED_CAL_ID && !CONFIG.OWNER_DISPLAY_NAME) {
     throw new Error('SHARED_CAL_ID is set but OWNER_DISPLAY_NAME is empty — team mode needs both.');
   }
-  const email = Session.getEffectiveUser().getEmail();
-  if (!email) {
-    throw new Error('Could not determine your email via Session.getEffectiveUser(); re-authorize and retry.');
-  }
-  PropertiesService.getScriptProperties().setProperty(PROP_OWNER_EMAIL, email);
-  migrateLegacyBlocks(email);
+  migrateLegacyBlocks(CONFIG.OWNER_EMAIL);
 
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'runSync')
@@ -74,24 +71,16 @@ function assertTzMatches() {
   }
 }
 
-let OWNER_EMAIL_CACHE = null;
-function getOwnerEmail() {
-  if (OWNER_EMAIL_CACHE) return OWNER_EMAIL_CACHE;
-  const e = PropertiesService.getScriptProperties().getProperty(PROP_OWNER_EMAIL);
-  if (!e) throw new Error('Owner email not set. Run initialSetup() once.');
-  OWNER_EMAIL_CACHE = e;
-  return e;
-}
-
 /** Main reconcile loop — invoked every CONFIG.SYNC_EVERY_MINUTES minutes by the trigger. */
 function runSync() {
   assertTzMatches();
+  if (!CONFIG.OWNER_EMAIL) throw new Error('OWNER_EMAIL is empty. Set it in CONFIG and re-run initialSetup().');
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(0)) return;
   const startedAt = Date.now();
   const overBudget = () => Date.now() - startedAt > CONFIG.RUN_BUDGET_MS;
   try {
-    const ownerEmail = getOwnerEmail();
+    const ownerEmail = CONFIG.OWNER_EMAIL;
     const now = new Date();
     const horizon = new Date(now.getTime() + CONFIG.HORIZON_DAYS * 864e5);
     const teamMode = !!CONFIG.SHARED_CAL_ID;

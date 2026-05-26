@@ -1,5 +1,5 @@
 {
-  "timeZone": "Europe/Bratislava",
+  "timeZone": "Europe/Prague",
   "runtimeVersion": "V8",
   "exceptionLogging": "STACKDRIVER",
   "dependencies": {

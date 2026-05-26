@@ -72,16 +72,18 @@ ship. Check **first**:
 5. Edit the `CONFIG` block at the top of `Code.gs`:
    - `PERSONAL_CAL_ID` = your personal email (the calendar ID you copied).
    - `WORK_CAL_ID` stays `'primary'` (script writes to the work account's own primary calendar).
-   - `TZ` matches `appsscript.json#timeZone` (both default to `Europe/Bratislava`).
+   - `OWNER_EMAIL` = your **work** email. Used as a stable key tagged onto every managed block so
+     the reconcile listing can tell yours apart from a colleague's (team mode) or from any legacy
+     untagged block. Required even in solo mode.
+   - `TZ` matches `appsscript.json#timeZone` (both default to `Europe/Prague`).
    - `WORK_START_HOUR`, `WORK_END_HOUR`, `HORIZON_DAYS`, `SYNC_EVERY_MINUTES` as you like.
    - For team mode also fill `SHARED_CAL_ID` and `OWNER_DISPLAY_NAME` — see *Team mode*. Leave
      empty for solo.
 6. Run `initialSetup()` once: in the editor toolbar, **select `initialSetup` from the function
    dropdown** next to the *Run* button, save (Ctrl/Cmd-S), then click *Run*. Grant the OAuth scopes
-   when prompted. It captures your account email (used to tag your managed blocks), installs the
-   trigger at `SYNC_EVERY_MINUTES`, and runs the first reconcile. **Re-run `initialSetup()` after
-   any CONFIG change** (especially toggling team mode) — it also migrates any pre-existing managed
-   blocks to the owner-tagged format.
+   when prompted. It installs the trigger at `SYNC_EVERY_MINUTES` and runs the first reconcile.
+   **Re-run `initialSetup()` after any CONFIG change** (especially toggling team mode) — it also
+   migrates any pre-existing managed blocks to the owner-tagged format.
 7. **Failure notifications** — Apps Script editor → Triggers (clock icon, left rail) → on the
    `runSync` trigger row, *Edit* → *Failure notification settings* → **Notify me immediately**. The
    trigger auto-disables after repeated failures (typically if you revoke the share or hit auth
@@ -109,6 +111,9 @@ ship. Check **first**:
   finds them; otherwise the script doesn't see them and creates fresh ones.
 - **`SHARED_CAL_ID is set but OWNER_DISPLAY_NAME is empty`** — team mode needs both. Fill the
   display name in CONFIG and re-run `initialSetup()`.
+- **`OWNER_EMAIL is empty`** — set `OWNER_EMAIL` in CONFIG to your work email and re-run
+  `initialSetup()`. This value is used to tag your managed blocks; without it the reconcile can't
+  isolate yours from anyone else's.
 
 ## Verify (do all of these once)
 
@@ -165,7 +170,8 @@ This intentionally replaces the manual practice of typing vacations into a share
 
 ### Per-colleague setup (each person does this once)
 
-Follow the normal Setup flow above, plus in step 5 fill in:
+Follow the normal Setup flow above. Your own `OWNER_EMAIL` (work email) is already required there.
+On top, in step 5 fill in:
 
 - `SHARED_CAL_ID` = the calendar ID from admin step 3 (same for everyone).
 - `OWNER_DISPLAY_NAME` = your own name, e.g. `'Adam Pagac'`. This becomes the title `OOO - Adam Pagac`
@@ -182,13 +188,13 @@ a colleague's OOO block.
 
 ### What lands where, summary
 
-| Personal event type            | Own work primary          | Shared team calendar      |
-|--------------------------------|---------------------------|---------------------------|
-| Timed Busy (e.g. doctor 14:00) | per-weekday clipped 08-18 | not synced                |
+| Personal event type            | Own work primary          | Shared team calendar                   |
+|--------------------------------|---------------------------|----------------------------------------|
+| Timed Busy (e.g. doctor 14:00) | per-weekday clipped 08-18 | not synced                             |
 | All-day Busy (e.g. vacation)   | per-weekday clipped 08-18 | full duration, all-day, `OOO - {Name}` |
-| All-day Free (default)         | not synced                | not synced                |
-| Declined / unanswered invite   | not synced                | not synced                |
-| Weekend-only Busy              | not synced (weekend skip) | full duration if all-day  |
+| All-day Free (default)         | not synced                | not synced                             |
+| Declined / unanswered invite   | not synced                | not synced                             |
+| Weekend-only Busy              | not synced (weekend skip) | full duration if all-day               |
 
 ### Migrating from manual OOO entries
 
@@ -198,19 +204,20 @@ ones either pass into the past or you delete them by hand once.
 
 ## Configuration reference
 
-| Constant             | Default                 | Notes                                                           |
-|----------------------|-------------------------|-----------------------------------------------------------------|
-| `PERSONAL_CAL_ID`    | `your.personal@…`       | The calendar shared *into* the work account.                    |
-| `WORK_CAL_ID`        | `'primary'`             | Work account's own primary calendar.                            |
-| `SHARED_CAL_ID`      | `''` (empty)            | Team OOO calendar ID. Empty = solo mode, no shared writes.      |
-| `OWNER_DISPLAY_NAME` | `''` (empty)            | Required if `SHARED_CAL_ID` set. Goes into `OOO - {name}` title.|
-| `TZ`                 | `'Europe/Bratislava'`   | Must match `appsscript.json#timeZone`.                          |
-| `WORK_START_HOUR`    | `8`                     | Inclusive.                                                      |
-| `WORK_END_HOUR`      | `18`                    | Exclusive.                                                      |
-| `HORIZON_DAYS`       | `90`                    | Rolling window (~3 months forward). Lower for faster first run. |
-| `BUSY_TITLE`         | `'Personal - Busy'`     | Title for own-primary blocks. Shared title is `OOO - {name}`.   |
-| `SYNC_EVERY_MINUTES` | `10`                    | Trigger interval. Valid: 1, 5, 10, 15, 30. 10 keeps team mode safely in quota. |
-| `RUN_BUDGET_MS`      | `300000` (5 min)        | Headroom under Apps Script's 6-min hard limit.                  |
+| Constant             | Default               | Notes                                                                                                                      |
+|----------------------|-----------------------|----------------------------------------------------------------------------------------------------------------------------|
+| `PERSONAL_CAL_ID`    | `your.personal@…`     | The calendar shared *into* the work account.                                                                               |
+| `WORK_CAL_ID`        | `'primary'`           | Work account's own primary calendar.                                                                                       |
+| `OWNER_EMAIL`        | `''` (empty)          | Your work email. Tagged onto every managed block as `pcalOwner` so the reconcile only ever touches your own. **Required.** |
+| `SHARED_CAL_ID`      | `''` (empty)          | Team OOO calendar ID. Empty = solo mode, no shared writes.                                                                 |
+| `OWNER_DISPLAY_NAME` | `''` (empty)          | Required if `SHARED_CAL_ID` set. Goes into `OOO - {name}` title.                                                           |
+| `TZ`                 | `'Europe/Prague'`     | Must match `appsscript.json#timeZone`.                                                                                     |
+| `WORK_START_HOUR`    | `8`                   | Inclusive.                                                                                                                 |
+| `WORK_END_HOUR`      | `18`                  | Exclusive.                                                                                                                 |
+| `HORIZON_DAYS`       | `90`                  | Rolling window (~3 months forward). Lower for faster first run.                                                            |
+| `BUSY_TITLE`         | `'Personal - Busy'`   | Title for own-primary blocks. Shared title is `OOO - {name}`.                                                              |
+| `SYNC_EVERY_MINUTES` | `10`                  | Trigger interval. Valid: 1, 5, 10, 15, 30. 10 keeps team mode safely in quota.                                             |
+| `RUN_BUDGET_MS`      | `300000` (5 min)      | Headroom under Apps Script's 6-min hard limit.                                                                             |
 
 ## Filtering rules (summary)
 
