@@ -137,7 +137,7 @@ On the personal calendar:
 - Apps Script editor → *Executions* → confirm no errors and runs complete well under 6 min.
   Click any `runSync` row to see its log. A healthy steady-state run looks like:
 
-  ```
+  ```text
   runSync: start mode=solo owner=adam.pagac@alistiq.com horizon=90d
   runSync: personal scan = 42 events (skipped: 35 free, 0 unanswered/declined, 0 cancelled) → 7 eligible, 9 own segments, 0 shared OOO
   runSync: existing managed = 9 on own
