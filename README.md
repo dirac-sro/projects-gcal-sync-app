@@ -4,8 +4,13 @@ One-way Google Calendar sync: when an event appears on your **personal** calenda
 **Mon–Fri 08:00–18:00**, a privacy-stripped `Personal - Busy` block appears on your **work**
 calendar. Colleagues see you're busy; they don't see what for.
 
-Runs as a Google Apps Script project hosted in your **work** account, polled every minute by a
-time-driven trigger. Latency ≈ 1 min.
+Runs as a Google Apps Script project hosted in your **work** account, polled by a time-driven
+trigger (default every 10 min, configurable). Latency ≈ trigger interval.
+
+**Team mode (optional):** if you also fill in `SHARED_CAL_ID` + `OWNER_DISPLAY_NAME`, each of your
+**all-day Busy** events additionally creates an `OOO - {Name}` all-day block on a shared team
+calendar — same one your colleagues use today for vacations. Timed events stay on your own
+calendar only. See *Team mode* below.
 
 ## How it works (in one paragraph)
 
@@ -68,10 +73,15 @@ ship. Check **first**:
    - `PERSONAL_CAL_ID` = your personal email (the calendar ID you copied).
    - `WORK_CAL_ID` stays `'primary'` (script writes to the work account's own primary calendar).
    - `TZ` matches `appsscript.json#timeZone` (both default to `Europe/Bratislava`).
-   - `WORK_START_HOUR`, `WORK_END_HOUR`, `HORIZON_DAYS` as you like.
+   - `WORK_START_HOUR`, `WORK_END_HOUR`, `HORIZON_DAYS`, `SYNC_EVERY_MINUTES` as you like.
+   - For team mode also fill `SHARED_CAL_ID` and `OWNER_DISPLAY_NAME` — see *Team mode*. Leave
+     empty for solo.
 6. Run `initialSetup()` once: in the editor toolbar, **select `initialSetup` from the function
    dropdown** next to the *Run* button, save (Ctrl/Cmd-S), then click *Run*. Grant the OAuth scopes
-   when prompted. It installs the every-1-min trigger and runs the first reconcile.
+   when prompted. It captures your account email (used to tag your managed blocks), installs the
+   trigger at `SYNC_EVERY_MINUTES`, and runs the first reconcile. **Re-run `initialSetup()` after
+   any CONFIG change** (especially toggling team mode) — it also migrates any pre-existing managed
+   blocks to the owner-tagged format.
 7. **Failure notifications** — Apps Script editor → Triggers (clock icon, left rail) → on the
    `runSync` trigger row, *Edit* → *Failure notification settings* → **Notify me immediately**. The
    trigger auto-disables after repeated failures (typically if you revoke the share or hit auth
@@ -92,7 +102,13 @@ ship. Check **first**:
   with `HORIZON_DAYS: 14`, run `initialSetup()` (fast), then bump back to `90` and run `runSync()`
   manually. The budget-aware reconcile + 1-min trigger fills the rest over the next few minutes.
 - **`Not Found` / 404 on `Calendar.Events.list`** — the personal calendar share hasn't been
-  accepted in the work account yet. See Setup step 2.
+  accepted in the work account yet, or `SHARED_CAL_ID` is wrong / the admin hasn't granted you
+  *Make changes* on the shared team calendar. See Setup step 2 and the *Team mode* section.
+- **After enabling team mode, duplicate blocks appear on own primary** — you forgot to re-run
+  `initialSetup()`. It backfills `pcalOwner` on legacy blocks so the new owner-filtered listing
+  finds them; otherwise the script doesn't see them and creates fresh ones.
+- **`SHARED_CAL_ID is set but OWNER_DISPLAY_NAME is empty`** — team mode needs both. Fill the
+  display name in CONFIG and re-run `initialSetup()`.
 
 ## Verify (do all of these once)
 
@@ -115,18 +131,86 @@ On the personal calendar:
 - Run `runSync()` manually a few times from the editor → no duplicates appear (idempotency).
 - Apps Script editor → *Executions* → confirm no errors and runs complete well under 6 min.
 
+**Team mode only (do once after enabling):**
+
+- Create an **all-day Busy** event "Vacation" Mon-Wed on your personal calendar → within
+  `SYNC_EVERY_MINUTES`: own primary gets a clipped block 08-18 on each weekday; shared team
+  calendar gets one all-day `OOO - {YourName}` block spanning Mon-Wed.
+- Have a colleague (also running the script) create their own all-day event → both your OOO and
+  theirs coexist on the shared calendar, neither overwrites the other.
+- Delete your all-day event → both your own block and your OOO on shared disappear; colleague's
+  OOO is untouched.
+- Change `OWNER_DISPLAY_NAME` and re-run `initialSetup()` + `runSync()` → existing shared blocks
+  re-title to the new name (hash-driven update path).
+
+## Team mode (shared OOO calendar for N colleagues)
+
+Each colleague installs their own copy of the script in their own work account; all installs write
+their **OOO blocks** (only all-day Busy events) to a **single shared team calendar** as all-day
+`OOO - {Name}` events. Timed events stay on each person's own primary, untouched by anyone else.
+
+This intentionally replaces the manual practice of typing vacations into a shared calendar.
+
+### One-time admin work (done once for the whole team)
+
+1. **Create or pick the shared team calendar.** In any work account, [Google Calendar](https://calendar.google.com)
+   → *+* next to *Other calendars* → *Create new calendar*. Or use the existing OOO calendar your
+   team already uses.
+2. **Grant edit access to every team member.** Calendar settings → *Share with specific people or
+   groups* → add each colleague's work email with **"Make changes to events."** Read-only is not
+   enough — each script needs to write its OOO blocks.
+3. **Copy the calendar ID.** Calendar settings → *Integrate calendar* → *Calendar ID*. It looks
+   like `xxxxxxxxxxxx@group.calendar.google.com`. Distribute this to all team members — it's the
+   value they put into `SHARED_CAL_ID`.
+
+### Per-colleague setup (each person does this once)
+
+Follow the normal Setup flow above, plus in step 5 fill in:
+
+- `SHARED_CAL_ID` = the calendar ID from admin step 3 (same for everyone).
+- `OWNER_DISPLAY_NAME` = your own name, e.g. `'Adam Pagac'`. This becomes the title `OOO - Adam Pagac`
+  on the shared calendar so colleagues can see whose OOO it is.
+
+Then run `initialSetup()` as usual.
+
+### How blocks are isolated between users
+
+Every managed block is tagged with `pcalOwner = <your work email>` in `extendedProperties.private`.
+The reconcile listing filters with both `pcalManaged=true` **AND** `pcalOwner=<self>`, so each
+person's script only ever sees / touches its own blocks. No cleanup wars, no accidental deletes of
+a colleague's OOO block.
+
+### What lands where, summary
+
+| Personal event type            | Own work primary          | Shared team calendar      |
+|--------------------------------|---------------------------|---------------------------|
+| Timed Busy (e.g. doctor 14:00) | per-weekday clipped 08-18 | not synced                |
+| All-day Busy (e.g. vacation)   | per-weekday clipped 08-18 | full duration, all-day, `OOO - {Name}` |
+| All-day Free (default)         | not synced                | not synced                |
+| Declined / unanswered invite   | not synced                | not synced                |
+| Weekend-only Busy              | not synced (weekend skip) | full duration if all-day  |
+
+### Migrating from manual OOO entries
+
+Existing manually-typed OOO entries on the shared calendar have no `pcalManaged` tag → scripts
+ignore them (won't delete them, won't update them). Stop adding new ones manually; the existing
+ones either pass into the past or you delete them by hand once.
+
 ## Configuration reference
 
-| Constant          | Default               | Notes                                                           |
-|-------------------|-----------------------|-----------------------------------------------------------------|
-| `PERSONAL_CAL_ID` | `your.personal@…`     | The calendar shared *into* the work account.                    |
-| `WORK_CAL_ID`     | `'primary'`           | Work account's own primary calendar.                            |
-| `TZ`              | `'Europe/Bratislava'` | Must match `appsscript.json#timeZone`.                          |
-| `WORK_START_HOUR` | `8`                   | Inclusive.                                                      |
-| `WORK_END_HOUR`   | `18`                  | Exclusive.                                                      |
-| `HORIZON_DAYS`    | `90`                  | Rolling window (~3 months forward). Lower for faster first run. |
-| `BUSY_TITLE`      | `'Personal - Busy'`   | Title shown to colleagues.                                      |
-| `RUN_BUDGET_MS`   | `300000` (5 min)      | Headroom under Apps Script's 6-min hard limit.                  |
+| Constant             | Default                 | Notes                                                           |
+|----------------------|-------------------------|-----------------------------------------------------------------|
+| `PERSONAL_CAL_ID`    | `your.personal@…`       | The calendar shared *into* the work account.                    |
+| `WORK_CAL_ID`        | `'primary'`             | Work account's own primary calendar.                            |
+| `SHARED_CAL_ID`      | `''` (empty)            | Team OOO calendar ID. Empty = solo mode, no shared writes.      |
+| `OWNER_DISPLAY_NAME` | `''` (empty)            | Required if `SHARED_CAL_ID` set. Goes into `OOO - {name}` title.|
+| `TZ`                 | `'Europe/Bratislava'`   | Must match `appsscript.json#timeZone`.                          |
+| `WORK_START_HOUR`    | `8`                     | Inclusive.                                                      |
+| `WORK_END_HOUR`      | `18`                    | Exclusive.                                                      |
+| `HORIZON_DAYS`       | `90`                    | Rolling window (~3 months forward). Lower for faster first run. |
+| `BUSY_TITLE`         | `'Personal - Busy'`     | Title for own-primary blocks. Shared title is `OOO - {name}`.   |
+| `SYNC_EVERY_MINUTES` | `10`                    | Trigger interval. Valid: 1, 5, 10, 15, 30. 10 keeps team mode safely in quota. |
+| `RUN_BUDGET_MS`      | `300000` (5 min)        | Headroom under Apps Script's 6-min hard limit.                  |
 
 ## Filtering rules (summary)
 
@@ -142,8 +226,13 @@ On the personal calendar:
 
 ## Operational notes
 
-- **Quota** — two calendar `list` calls per minute, plus reconcile writes (usually 0). Well within
-  Calendar API quota and the Workspace 6 hr/day Apps Script execution limit.
+- **Quota** — at `SYNC_EVERY_MINUTES=10`: 2 list calls per run in solo mode (3 in team mode) + a
+  few writes only when something changes. Per user per day ≈ 430-650 calls. For a 10-person team
+  all hitting the shared calendar that's ~6000 calls/day team-wide, well under the per-project
+  1M/day Calendar API quota and the per-user Workspace 6 hr/day Apps Script execution limit.
+- **Sync interval trade-off** — `1` = ~1 min latency but ~10× the API calls. `10` is the safe
+  default for team mode. Drop to `5` if you want faster vacation propagation; `30` if you really
+  want to minimize quota use and don't mind half-hour latency.
 - **Past blocks** — past managed blocks accumulate forever on the work calendar; harmless. Add a
   weekly cleanup trigger if you ever want a clean history.
 - **`HORIZON_DAYS` trade-off** — events scheduled beyond the horizon don't sync until the rolling

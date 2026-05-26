@@ -1,23 +1,67 @@
 /** ---------- CONFIG ---------- */
 const CONFIG = {
-  PERSONAL_CAL_ID: 'your.personal@gmail.com', // shared INTO the work account ("See all event details") + accepted
-  WORK_CAL_ID:     'primary',                  // the work calendar this script account owns
-  TZ:              'Europe/Bratislava',         // must match appsscript.json "timeZone"
-  WORK_START_HOUR: 8,
-  WORK_END_HOUR:   18,
-  HORIZON_DAYS:    90,                          // rolling window (~3 months forward)
-  BUSY_TITLE:      'Personal - Busy',
-  RUN_BUDGET_MS:   5 * 60 * 1000,               // leave ~1 min headroom under the 6-min hard limit
+  PERSONAL_CAL_ID:    'your.personal@gmail.com', // shared INTO the work account ("See all event details") + accepted
+  WORK_CAL_ID:        'primary',                  // the work calendar this script account owns
+  SHARED_CAL_ID:      '',                         // OPTIONAL: team OOO calendar. Empty = solo mode (no shared writes).
+  OWNER_DISPLAY_NAME: '',                         // REQUIRED if SHARED_CAL_ID set. e.g. 'Adam Pagac' → 'OOO - Adam Pagac'
+  TZ:                 'Europe/Bratislava',         // must match appsscript.json "timeZone"
+  WORK_START_HOUR:    8,
+  WORK_END_HOUR:      18,
+  HORIZON_DAYS:       90,                          // rolling window (~3 months forward)
+  BUSY_TITLE:         'Personal - Busy',           // title for blocks on own work calendar
+  SYNC_EVERY_MINUTES: 10,                          // trigger interval. Valid: 1, 5, 10, 15, 30. 10 keeps team mode safely in quota.
+  RUN_BUDGET_MS:      5 * 60 * 1000,               // leave ~1 min headroom under the 6-min hard limit
 };
 
-/** Run ONCE manually: validates config, authorizes, installs the 1-minute trigger, does the first sync. */
+const PROP_OWNER_EMAIL = 'pcalOwnerEmail';
+
+/** Run ONCE manually (and again after any CONFIG change): validates, captures owner email,
+ *  migrates legacy blocks to tagged-by-owner form, installs the trigger, runs first reconcile. */
 function initialSetup() {
   assertTzMatches();
+  if (CONFIG.SHARED_CAL_ID && !CONFIG.OWNER_DISPLAY_NAME) {
+    throw new Error('SHARED_CAL_ID is set but OWNER_DISPLAY_NAME is empty — team mode needs both.');
+  }
+  const email = Session.getEffectiveUser().getEmail();
+  if (!email) {
+    throw new Error('Could not determine your email via Session.getEffectiveUser(); re-authorize and retry.');
+  }
+  PropertiesService.getScriptProperties().setProperty(PROP_OWNER_EMAIL, email);
+  migrateLegacyBlocks(email);
+
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'runSync')
     .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('runSync').timeBased().everyMinutes(1).create();
+  ScriptApp.newTrigger('runSync').timeBased().everyMinutes(CONFIG.SYNC_EVERY_MINUTES).create();
   runSync();
+}
+
+/**
+ * Backfill pcalOwner on managed blocks created before team mode existed.
+ * Without this, the owner-filtered listing would miss them and runSync would
+ * create duplicates while old blocks linger forever.
+ */
+function migrateLegacyBlocks(email) {
+  const now = new Date();
+  const horizon = new Date(now.getTime() + CONFIG.HORIZON_DAYS * 864e5);
+  const cals = [CONFIG.WORK_CAL_ID];
+  if (CONFIG.SHARED_CAL_ID) cals.push(CONFIG.SHARED_CAL_ID);
+  let tagged = 0;
+  cals.forEach(calId => {
+    listEvents(calId, now, horizon, ['pcalManaged=true']).forEach(it => {
+      const priv = (it.extendedProperties && it.extendedProperties.private) || {};
+      if (priv.pcalOwner) return;
+      try {
+        Calendar.Events.patch({
+          extendedProperties: { private: Object.assign({}, priv, { pcalOwner: email }) }
+        }, calId, it.id);
+        tagged++;
+      } catch (e) {
+        console.warn('migrateLegacyBlocks: failed to tag %s on %s: %s', it.id, calId, e && e.message || e);
+      }
+    });
+  });
+  if (tagged) console.log('migrateLegacyBlocks: backfilled pcalOwner on %s block(s)', tagged);
 }
 
 function assertTzMatches() {
@@ -30,68 +74,125 @@ function assertTzMatches() {
   }
 }
 
-/** Main reconcile loop — invoked every minute by the trigger. */
+let OWNER_EMAIL_CACHE = null;
+function getOwnerEmail() {
+  if (OWNER_EMAIL_CACHE) return OWNER_EMAIL_CACHE;
+  const e = PropertiesService.getScriptProperties().getProperty(PROP_OWNER_EMAIL);
+  if (!e) throw new Error('Owner email not set. Run initialSetup() once.');
+  OWNER_EMAIL_CACHE = e;
+  return e;
+}
+
+/** Main reconcile loop — invoked every CONFIG.SYNC_EVERY_MINUTES minutes by the trigger. */
 function runSync() {
-  assertTzMatches(); // re-check every run: a later CONFIG.TZ edit must not silently desync.
+  assertTzMatches();
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(0)) return; // a prior run is still going — skip this tick
+  if (!lock.tryLock(0)) return;
   const startedAt = Date.now();
   const overBudget = () => Date.now() - startedAt > CONFIG.RUN_BUDGET_MS;
   try {
+    const ownerEmail = getOwnerEmail();
     const now = new Date();
     const horizon = new Date(now.getTime() + CONFIG.HORIZON_DAYS * 864e5);
+    const teamMode = !!CONFIG.SHARED_CAL_ID;
 
-    // 1) Desired state: per-day work-hour segments from eligible personal events.
-    const desired = {}; // key "sourceId|YYYY-MM-DD" -> { seg, sourceId }
+    // 1) Desired state — from one read of the personal calendar, fan out to both targets.
+    const desiredOwn = {};    // key "sourceId|YYYY-MM-DD" → { seg, sourceId }
+    const desiredShared = {}; // key "sourceId" → { sourceId, startDate, endDate }
     listEvents(CONFIG.PERSONAL_CAL_ID, now, horizon).forEach(ev => {
       if (ev.status === 'cancelled') return;
-      if (!isBusy(ev)) return;            // Free always wins (incl. default all-day = Free)
-      if (skipByResponse(ev)) return;     // declined OR not-yet-responded invites don't block
+      if (!isBusy(ev)) return;
+      if (skipByResponse(ev)) return;
+
+      // Own work primary: per-weekday segments clipped to work hours (current behavior, all event types).
       segmentsFor(ev).forEach(seg => {
-        if (seg.end <= now) return;       // ignore fully-past segments
-        desired[ev.id + '|' + seg.date] = { seg: seg, sourceId: ev.id };
+        if (seg.end <= now) return;
+        desiredOwn[ev.id + '|' + seg.date] = { seg: seg, sourceId: ev.id };
       });
-    });
 
-    // 2) Current state: managed busy blocks already on the work calendar.
-    const existing = {}; // key -> { id, hash }
-    listEvents(CONFIG.WORK_CAL_ID, now, horizon, 'pcalManaged=true').forEach(it => {
-      const p = (it.extendedProperties && it.extendedProperties.private) || {};
-      existing[p.pcalSourceId + '|' + p.pcalDate] = { id: it.id, hash: p.pcalHash };
-    });
-
-    // 3) Reconcile: create / update / delete.
-    // Each write wrapped so one bad event doesn't abort the whole run.
-    // Budget-aware: bail early if we're approaching the 6-min execution limit; next tick resumes.
-    const desiredKeys = Object.keys(desired);
-    for (let i = 0; i < desiredKeys.length; i++) {
-      if (overBudget()) { console.warn('runSync: over budget after %s desired ops; deferring rest', i); return; }
-      const key = desiredKeys[i];
-      const d = desired[key], ex = existing[key], h = hashOf(d.seg);
-      try {
-        if (!ex)                createBlock(d.seg, d.sourceId, h);
-        else if (ex.hash !== h) updateBlock(ex.id, d.seg, d.sourceId, h);
-      } catch (e) {
-        console.error('runSync: create/update failed for key=%s: %s', key, e && e.message || e);
+      // Shared OOO calendar: only all-day events, full duration, no clipping, no weekend skip.
+      if (teamMode && isAllDay(ev)) {
+        if (parseYmd(ev.end.date) <= now) return; // end.date is exclusive
+        desiredShared[ev.id] = {
+          sourceId: ev.id,
+          startDate: ev.start.date,
+          endDate: ev.end.date,
+        };
       }
-    }
+    });
 
-    const existingKeys = Object.keys(existing);
-    for (let i = 0; i < existingKeys.length; i++) {
-      if (overBudget()) { console.warn('runSync: over budget during deletes after %s ops; deferring rest', i); return; }
-      const key = existingKeys[i];
-      if (desired[key]) continue;
-      try { Calendar.Events.remove(CONFIG.WORK_CAL_ID, existing[key].id); }
-      catch (e) { console.error('runSync: delete failed for key=%s: %s', key, e && e.message || e); }
+    // 2) Existing state — owner-filtered listing per target calendar.
+    const ownerFilter = ['pcalManaged=true', 'pcalOwner=' + ownerEmail];
+    const existingOwn = indexExisting(
+      listEvents(CONFIG.WORK_CAL_ID, now, horizon, ownerFilter),
+      p => p.pcalSourceId + '|' + p.pcalDate
+    );
+    const existingShared = teamMode ? indexExisting(
+      listEvents(CONFIG.SHARED_CAL_ID, now, horizon, ownerFilter),
+      p => p.pcalSourceId
+    ) : {};
+
+    // 3) Reconcile each target independently.
+    reconcile(
+      desiredOwn, existingOwn,
+      d => hashOfOwn(d.seg),
+      (d, h) => Calendar.Events.insert(blockBodyOwn(d.seg, d.sourceId, h, ownerEmail), CONFIG.WORK_CAL_ID),
+      (id, d, h) => Calendar.Events.patch(blockBodyOwn(d.seg, d.sourceId, h, ownerEmail), CONFIG.WORK_CAL_ID, id),
+      id => Calendar.Events.remove(CONFIG.WORK_CAL_ID, id),
+      overBudget, 'own'
+    );
+    if (teamMode) {
+      reconcile(
+        desiredShared, existingShared,
+        d => hashOfShared(d),
+        (d, h) => Calendar.Events.insert(blockBodyShared(d, h, ownerEmail), CONFIG.SHARED_CAL_ID),
+        (id, d, h) => Calendar.Events.patch(blockBodyShared(d, h, ownerEmail), CONFIG.SHARED_CAL_ID, id),
+        id => Calendar.Events.remove(CONFIG.SHARED_CAL_ID, id),
+        overBudget, 'shared'
+      );
     }
   } finally {
     lock.releaseLock();
   }
 }
 
+/** ---------- reconcile ---------- */
+
+function reconcile(desired, existing, hashFn, createFn, updateFn, deleteFn, overBudget, label) {
+  const desiredKeys = Object.keys(desired);
+  for (let i = 0; i < desiredKeys.length; i++) {
+    if (overBudget()) { console.warn('runSync[%s]: over budget after %s desired ops; deferring rest', label, i); return; }
+    const key = desiredKeys[i];
+    const d = desired[key], ex = existing[key], h = hashFn(d);
+    try {
+      if (!ex)                createFn(d, h);
+      else if (ex.hash !== h) updateFn(ex.id, d, h);
+    } catch (e) {
+      console.error('runSync[%s]: create/update failed for key=%s: %s', label, key, e && e.message || e);
+    }
+  }
+  const existingKeys = Object.keys(existing);
+  for (let i = 0; i < existingKeys.length; i++) {
+    if (overBudget()) { console.warn('runSync[%s]: over budget during deletes after %s ops; deferring rest', label, i); return; }
+    const key = existingKeys[i];
+    if (desired[key]) continue;
+    try { deleteFn(existing[key].id); }
+    catch (e) { console.error('runSync[%s]: delete failed for key=%s: %s', label, key, e && e.message || e); }
+  }
+}
+
+function indexExisting(items, keyFn) {
+  const out = {};
+  items.forEach(it => {
+    const p = (it.extendedProperties && it.extendedProperties.private) || {};
+    out[keyFn(p)] = { id: it.id, hash: p.pcalHash };
+  });
+  return out;
+}
+
 /** ---------- helpers ---------- */
 
-function listEvents(calId, timeMin, timeMax, privateExtProp) {
+function listEvents(calId, timeMin, timeMax, privateExtProps) {
   const out = [];
   let pageToken;
   do {
@@ -104,7 +205,7 @@ function listEvents(calId, timeMin, timeMax, privateExtProp) {
       maxResults: 2500,
       pageToken: pageToken,
     };
-    if (privateExtProp) params.privateExtendedProperty = privateExtProp;
+    if (privateExtProps && privateExtProps.length) params.privateExtendedProperty = privateExtProps;
     const resp = Calendar.Events.list(calId, params);
     (resp.items || []).forEach(i => out.push(i));
     pageToken = resp.nextPageToken;
@@ -113,13 +214,14 @@ function listEvents(calId, timeMin, timeMax, privateExtProp) {
 }
 
 function isBusy(ev) { return ev.transparency !== 'transparent'; }
+function isAllDay(ev) { return !!(ev.start.date && !ev.start.dateTime); }
 
 /**
  * Skip events the user hasn't actively committed to:
- *  - declined → obviously skip
- *  - needsAction (pending invite) → skip; user hasn't said yes
+ *  - declined → skip
+ *  - needsAction (pending invite) → skip
  *  - accepted / tentative → keep (tentative still holds time)
- * If there's no attendees array (e.g. self-organized event with no invitees), keep.
+ * If there's no attendees array (self-organized event with no invitees), keep.
  */
 function skipByResponse(ev) {
   if (!ev.attendees) return false;
@@ -130,7 +232,7 @@ function skipByResponse(ev) {
 
 /** Split an event into one clipped [08:00,18:00] segment per weekday it touches. */
 function segmentsFor(ev) {
-  const allDay = !!(ev.start.date && !ev.start.dateTime);
+  const allDay = isAllDay(ev);
   const coverStart = allDay ? parseYmd(ev.start.date) : new Date(ev.start.dateTime);
   const coverEnd   = allDay ? parseYmd(ev.end.date)   : new Date(ev.end.dateTime); // end exclusive
   const segs = [];
@@ -149,24 +251,40 @@ function segmentsFor(ev) {
   return segs;
 }
 
-function createBlock(seg, sourceId, hash) {
-  Calendar.Events.insert(blockBody(seg, sourceId, hash), CONFIG.WORK_CAL_ID);
-}
-function updateBlock(eventId, seg, sourceId, hash) {
-  Calendar.Events.patch(blockBody(seg, sourceId, hash), CONFIG.WORK_CAL_ID, eventId);
-}
-function blockBody(seg, sourceId, hash) {
+function blockBodyOwn(seg, sourceId, hash, ownerEmail) {
   return {
     summary: CONFIG.BUSY_TITLE,
     start: { dateTime: seg.start.toISOString() },
     end:   { dateTime: seg.end.toISOString() },
     reminders: { useDefault: false },
     extendedProperties: { private: {
-      pcalManaged: 'true', pcalSourceId: sourceId, pcalDate: seg.date, pcalHash: hash,
+      pcalManaged: 'true',
+      pcalOwner:   ownerEmail,
+      pcalSourceId: sourceId,
+      pcalDate:    seg.date,
+      pcalHash:    hash,
     }},
   };
 }
 
-function hashOf(seg) { return seg.start.getTime() + '-' + seg.end.getTime(); }
+function blockBodyShared(d, hash, ownerEmail) {
+  return {
+    summary: 'OOO - ' + CONFIG.OWNER_DISPLAY_NAME,
+    start: { date: d.startDate },
+    end:   { date: d.endDate },
+    reminders: { useDefault: false },
+    extendedProperties: { private: {
+      pcalManaged: 'true',
+      pcalOwner:   ownerEmail,
+      pcalSourceId: d.sourceId,
+      pcalDate:    d.startDate,
+      pcalHash:    hash,
+    }},
+  };
+}
+
+function hashOfOwn(seg) { return seg.start.getTime() + '-' + seg.end.getTime(); }
+function hashOfShared(d) { return d.startDate + '|' + d.endDate + '|' + CONFIG.OWNER_DISPLAY_NAME; }
+
 function parseYmd(s) { const p = s.split('-'); return new Date(+p[0], +p[1] - 1, +p[2]); }
 function fmtDate(d) { return Utilities.formatDate(d, CONFIG.TZ, 'yyyy-MM-dd'); }
