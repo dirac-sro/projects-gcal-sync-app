@@ -11,7 +11,7 @@
 /** ===== CONFIG ===== */
 
 const CONFIG = {
-  PERSONAL_CAL_ID:    'your.personal@gmail.com',   // shared INTO the work account ("See all event details") + accepted
+  PERSONAL_CAL_IDS:   ['your.personal@gmail.com'], // one or more source calendars shared INTO this account ("See all event details" or "free/busy"). Accepts a single string for back-compat.
   WORK_CAL_ID:        'primary',                   // the work calendar this script account owns
   OWNER_EMAIL:        'your.work@email.com',       // your work email — used as a stable key to tag your managed blocks. Required.
   SHARED_CAL_ID:      '',                          // OPTIONAL: team OOO calendar. Empty = solo mode (no shared writes).
@@ -40,6 +40,9 @@ function initialSetup() {
   assertTzMatches();
   if (!CONFIG.OWNER_EMAIL) {
     throw new Error('OWNER_EMAIL is empty — set it to your work email in CONFIG.');
+  }
+  if (sourceCalIds().length === 0) {
+    throw new Error('PERSONAL_CAL_IDS is empty — set at least one source calendar ID in CONFIG.');
   }
   if (CONFIG.SHARED_CAL_ID && !CONFIG.OWNER_DISPLAY_NAME) {
     throw new Error('SHARED_CAL_ID is set but OWNER_DISPLAY_NAME is empty — team mode needs both.');
@@ -79,33 +82,37 @@ function runSync() {
     const now = new Date();
     const horizon = new Date(now.getTime() + CONFIG.HORIZON_DAYS * 864e5);
     const teamMode = !!CONFIG.SHARED_CAL_ID;
-    console.log('runSync: start mode=%s owner=%s horizon=%dd', teamMode ? 'team' : 'solo', ownerEmail, CONFIG.HORIZON_DAYS);
+    const sources = sourceCalIds();
+    console.log('runSync: start mode=%s owner=%s sources=%d horizon=%dd', teamMode ? 'team' : 'solo', ownerEmail, sources.length, CONFIG.HORIZON_DAYS);
 
-    // Phase 1: desired state — from one read of the personal calendar, fan out to both targets.
+    // Phase 1: desired state — read each source calendar, merge all events into the same two
+    // desired maps. Event IDs are globally unique across calendars so keys never collide.
     const desiredOwn = {};    // key "sourceId|YYYY-MM-DD" → { seg, sourceId }
     const desiredShared = {}; // key "sourceId" → { sourceId, startDate, endDate }
     let scanned = 0, eligible = 0, skipFree = 0, skipResponse = 0, skipCancelled = 0;
-    listEvents(CONFIG.PERSONAL_CAL_ID, now, horizon).forEach(ev => {
-      scanned++;
-      if (ev.status === 'cancelled') { skipCancelled++; return; }
-      if (!isBusy(ev))               { skipFree++; return; }
-      if (skipByResponse(ev))        { skipResponse++; return; }
-      eligible++;
+    sources.forEach(calId => {
+      listEvents(calId, now, horizon).forEach(ev => {
+        scanned++;
+        if (ev.status === 'cancelled') { skipCancelled++; return; }
+        if (!isBusy(ev))               { skipFree++; return; }
+        if (skipByResponse(ev))        { skipResponse++; return; }
+        eligible++;
 
-      // Personal target: per-weekday segments clipped to work hours, all event types.
-      segmentsFor(ev).forEach(seg => {
-        if (seg.end <= now) return;
-        desiredOwn[ev.id + '|' + seg.date] = { seg, sourceId: ev.id };
+        // Personal target: per-weekday segments clipped to work hours, all event types.
+        segmentsFor(ev).forEach(seg => {
+          if (seg.end <= now) return;
+          desiredOwn[ev.id + '|' + seg.date] = { seg, sourceId: ev.id };
+        });
+
+        // Shared OOO target: only all-day events, full duration, no clipping, no weekend skip.
+        if (teamMode && isAllDay(ev)) {
+          if (parseYmd(ev.end.date) <= now) return; // end.date is exclusive
+          desiredShared[ev.id] = { sourceId: ev.id, startDate: ev.start.date, endDate: ev.end.date };
+        }
       });
-
-      // Shared OOO target: only all-day events, full duration, no clipping, no weekend skip.
-      if (teamMode && isAllDay(ev)) {
-        if (parseYmd(ev.end.date) <= now) return; // end.date is exclusive
-        desiredShared[ev.id] = { sourceId: ev.id, startDate: ev.start.date, endDate: ev.end.date };
-      }
     });
-    console.log('runSync: personal scan = %d events (skipped: %d free, %d unanswered/declined, %d cancelled) → %d eligible, %d own segments, %d shared OOO',
-      scanned, skipFree, skipResponse, skipCancelled, eligible, Object.keys(desiredOwn).length, Object.keys(desiredShared).length);
+    console.log('runSync: personal scan = %d events from %d source(s) (skipped: %d free, %d unanswered/declined, %d cancelled) → %d eligible, %d own segments, %d shared OOO',
+      scanned, sources.length, skipFree, skipResponse, skipCancelled, eligible, Object.keys(desiredOwn).length, Object.keys(desiredShared).length);
 
     // Phase 2: existing state — owner-filtered listing per target.
     const ownerFilter = ['pcalManaged=true', 'pcalOwner=' + ownerEmail];
@@ -282,6 +289,17 @@ function indexExisting(items, keyFn) {
 }
 
 /** ===== SOURCE PARSING ===== */
+
+/**
+ * Normalize CONFIG.PERSONAL_CAL_IDS into an array of non-empty calendar IDs.
+ * Accepts either a single string (back-compat: a v0.1 config will keep working) or an array.
+ * Strips empty entries so an array with placeholders doesn't crash listEvents.
+ */
+function sourceCalIds() {
+  const raw = CONFIG.PERSONAL_CAL_IDS;
+  const arr = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+  return arr.filter(s => typeof s === 'string' && s.length > 0);
+}
 
 /** Event is busy when transparency is opaque or unset (Google default for timed events). */
 function isBusy(ev) { return ev.transparency !== 'transparent'; }

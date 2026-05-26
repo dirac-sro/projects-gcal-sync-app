@@ -31,6 +31,9 @@ credentials to store.
 
 - **Privacy-first.** Source events are mirrored as opaque `Personal - Busy` blocks. No title,
   location, attendees, or description crosses over.
+- **Multi-source.** One or more source calendars feed the same target. All sources merge into a
+  single set of mirror blocks; event IDs are globally unique so blocks from different sources
+  never collide.
 - **Work-hour clipping.** Only the portion that falls within configured work hours is reflected;
   weekends are skipped on the personal target.
 - **Recurring + multi-day support.** The Calendar API expands recurring events into individual
@@ -161,10 +164,10 @@ In `Code.gs`, edit the `CONFIG` block at the top of the file:
 
 ```javascript
 const CONFIG = {
-  PERSONAL_CAL_ID:    '<source-calendar-id>',   // from step 1
-  WORK_CAL_ID:        'primary',                 // target calendar; usually 'primary'
-  OWNER_EMAIL:        '<target-account-email>',  // used to tag managed blocks. Required.
-  TZ:                 'Europe/Prague',           // must match appsscript.json#timeZone
+  PERSONAL_CAL_IDS:   ['<source-calendar-id>'],  // one or more sources from step 1
+  WORK_CAL_ID:        'primary',                  // target calendar; usually 'primary'
+  OWNER_EMAIL:        '<target-account-email>',   // used to tag managed blocks. Required.
+  TZ:                 'Europe/Prague',            // must match appsscript.json#timeZone
   WORK_START_HOUR:    8,
   WORK_END_HOUR:      18,
   HORIZON_DAYS:       90,
@@ -172,6 +175,19 @@ const CONFIG = {
   // ... see Configuration reference for the rest
 };
 ```
+
+To mirror **multiple source calendars** (e.g. a personal Gmail plus a calendar shared in from
+another Workspace), list them all in `PERSONAL_CAL_IDS`:
+
+```javascript
+PERSONAL_CAL_IDS: [
+  'me@gmail.com',
+  'shared-from-partner-workspace@group.calendar.google.com',
+],
+```
+
+All sources are merged into one set of `Personal - Busy` blocks on the target. Repeat the
+sharing flow from step 1 for each additional source.
 
 For team mode, also set `SHARED_CAL_ID` and `OWNER_DISPLAY_NAME` — see
 [Team mode](#team-mode-multi-user--shared-ooo-calendar).
@@ -248,7 +264,7 @@ All configuration lives in the `CONFIG` block at the top of [`Code.gs`](Code.gs)
 
 | Constant             | Default               | Notes                                                                                                                      |
 |----------------------|-----------------------|----------------------------------------------------------------------------------------------------------------------------|
-| `PERSONAL_CAL_ID`    | placeholder           | Source calendar ID. Must be shared into the target account with *See all event details*.                                   |
+| `PERSONAL_CAL_IDS`   | placeholder array     | One or more source calendar IDs. Each must be shared into the target account. Accepts a single string for back-compat.     |
 | `WORK_CAL_ID`        | `'primary'`           | Target calendar; usually the script account's primary calendar.                                                            |
 | `OWNER_EMAIL`        | placeholder           | **Required.** Tagged onto every managed block as `pcalOwner` so reconcile only ever touches your own.                      |
 | `SHARED_CAL_ID`      | `''`                  | Team OOO calendar ID. Empty = solo mode, no shared writes.                                                                 |
@@ -322,6 +338,9 @@ When something changed: `runSync[own]: +2 created, ~1 updated, -0 deleted, 0 fai
 - **`Not Found` / 404 on `Calendar.Events.list`** — the source calendar share was not accepted in
   the target account; or `SHARED_CAL_ID` is wrong / lacks *Make changes* permission for this user.
 - **`OWNER_EMAIL is empty`** — set it in `CONFIG` and re-run `initialSetup()`.
+- **`PERSONAL_CAL_IDS is empty`** — set at least one source calendar ID. If you're upgrading from
+  a version that used the singular `PERSONAL_CAL_ID`, rename the field; the new name is plural
+  and takes either a single string or an array. See [CHANGELOG.md](CHANGELOG.md).
 - **`SHARED_CAL_ID is set but OWNER_DISPLAY_NAME is empty`** — team mode requires both.
 - **First `initialSetup()` runs slow or risks the 6-min limit** — temporarily lower
   `HORIZON_DAYS` to `14`, run `initialSetup()` (fast), then bump back to `90` and run `runSync()`
