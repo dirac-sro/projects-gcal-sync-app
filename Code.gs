@@ -30,6 +30,7 @@ function initialSetup() {
     .filter(t => t.getHandlerFunction() === 'runSync')
     .forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('runSync').timeBased().everyMinutes(CONFIG.SYNC_EVERY_MINUTES).create();
+  console.log('initialSetup: trigger installed (every %d min), running first reconcile…', CONFIG.SYNC_EVERY_MINUTES);
   runSync();
 }
 
@@ -76,7 +77,10 @@ function runSync() {
   assertTzMatches();
   if (!CONFIG.OWNER_EMAIL) throw new Error('OWNER_EMAIL is empty. Set it in CONFIG and re-run initialSetup().');
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(0)) return;
+  if (!lock.tryLock(0)) {
+    console.log('runSync: skipped — prior run still holding the lock');
+    return;
+  }
   const startedAt = Date.now();
   const overBudget = () => Date.now() - startedAt > CONFIG.RUN_BUDGET_MS;
   try {
@@ -84,14 +88,18 @@ function runSync() {
     const now = new Date();
     const horizon = new Date(now.getTime() + CONFIG.HORIZON_DAYS * 864e5);
     const teamMode = !!CONFIG.SHARED_CAL_ID;
+    console.log('runSync: start mode=%s owner=%s horizon=%dd', teamMode ? 'team' : 'solo', ownerEmail, CONFIG.HORIZON_DAYS);
 
     // 1) Desired state — from one read of the personal calendar, fan out to both targets.
     const desiredOwn = {};    // key "sourceId|YYYY-MM-DD" → { seg, sourceId }
     const desiredShared = {}; // key "sourceId" → { sourceId, startDate, endDate }
+    let scanned = 0, eligible = 0, skipFree = 0, skipResponse = 0, skipCancelled = 0;
     listEvents(CONFIG.PERSONAL_CAL_ID, now, horizon).forEach(ev => {
-      if (ev.status === 'cancelled') return;
-      if (!isBusy(ev)) return;
-      if (skipByResponse(ev)) return;
+      scanned++;
+      if (ev.status === 'cancelled') { skipCancelled++; return; }
+      if (!isBusy(ev))               { skipFree++; return; }
+      if (skipByResponse(ev))        { skipResponse++; return; }
+      eligible++;
 
       // Own work primary: per-weekday segments clipped to work hours (current behavior, all event types).
       segmentsFor(ev).forEach(seg => {
@@ -109,6 +117,8 @@ function runSync() {
         };
       }
     });
+    console.log('runSync: personal scan = %d events (skipped: %d free, %d unanswered/declined, %d cancelled) → %d eligible, %d own segments, %d shared OOO',
+      scanned, skipFree, skipResponse, skipCancelled, eligible, Object.keys(desiredOwn).length, Object.keys(desiredShared).length);
 
     // 2) Existing state — owner-filtered listing per target calendar.
     const ownerFilter = ['pcalManaged=true', 'pcalOwner=' + ownerEmail];
@@ -120,9 +130,11 @@ function runSync() {
       listEvents(CONFIG.SHARED_CAL_ID, now, horizon, ownerFilter),
       p => p.pcalSourceId
     ) : {};
+    console.log('runSync: existing managed = %d on own%s', Object.keys(existingOwn).length,
+      teamMode ? (', ' + Object.keys(existingShared).length + ' on shared') : '');
 
-    // 3) Reconcile each target independently.
-    reconcile(
+    // 3) Reconcile each target independently. Each reconcile returns {created, updated, deleted, deferred}.
+    const sumOwn = reconcile(
       desiredOwn, existingOwn,
       d => hashOfOwn(d.seg),
       (d, h) => Calendar.Events.insert(blockBodyOwn(d.seg, d.sourceId, h, ownerEmail), CONFIG.WORK_CAL_ID),
@@ -130,8 +142,10 @@ function runSync() {
       id => Calendar.Events.remove(CONFIG.WORK_CAL_ID, id),
       overBudget, 'own'
     );
+    logReconcile('own', sumOwn);
+
     if (teamMode) {
-      reconcile(
+      const sumShared = reconcile(
         desiredShared, existingShared,
         d => hashOfShared(d),
         (d, h) => Calendar.Events.insert(blockBodyShared(d, h, ownerEmail), CONFIG.SHARED_CAL_ID),
@@ -139,35 +153,53 @@ function runSync() {
         id => Calendar.Events.remove(CONFIG.SHARED_CAL_ID, id),
         overBudget, 'shared'
       );
+      logReconcile('shared', sumShared);
     }
+    console.log('runSync: done in %dms', Date.now() - startedAt);
   } finally {
     lock.releaseLock();
   }
 }
 
+function logReconcile(label, s) {
+  const changed = s.created || s.updated || s.deleted || s.failed;
+  if (!changed && !s.deferred) {
+    console.log('runSync[%s]: no changes', label);
+    return;
+  }
+  console.log('runSync[%s]: +%d created, ~%d updated, -%d deleted, %d failed%s',
+    label, s.created, s.updated, s.deleted, s.failed, s.deferred ? ' (DEFERRED: over budget)' : '');
+}
+
 /** ---------- reconcile ---------- */
 
 function reconcile(desired, existing, hashFn, createFn, updateFn, deleteFn, overBudget, label) {
+  const s = { created: 0, updated: 0, deleted: 0, failed: 0, deferred: false };
   const desiredKeys = Object.keys(desired);
   for (let i = 0; i < desiredKeys.length; i++) {
-    if (overBudget()) { console.warn('runSync[%s]: over budget after %s desired ops; deferring rest', label, i); return; }
+    if (overBudget()) { s.deferred = true; return s; }
     const key = desiredKeys[i];
     const d = desired[key], ex = existing[key], h = hashFn(d);
     try {
-      if (!ex)                createFn(d, h);
-      else if (ex.hash !== h) updateFn(ex.id, d, h);
+      if (!ex)                { createFn(d, h); s.created++; }
+      else if (ex.hash !== h) { updateFn(ex.id, d, h); s.updated++; }
     } catch (e) {
+      s.failed++;
       console.error('runSync[%s]: create/update failed for key=%s: %s', label, key, e && e.message || e);
     }
   }
   const existingKeys = Object.keys(existing);
   for (let i = 0; i < existingKeys.length; i++) {
-    if (overBudget()) { console.warn('runSync[%s]: over budget during deletes after %s ops; deferring rest', label, i); return; }
+    if (overBudget()) { s.deferred = true; return s; }
     const key = existingKeys[i];
     if (desired[key]) continue;
-    try { deleteFn(existing[key].id); }
-    catch (e) { console.error('runSync[%s]: delete failed for key=%s: %s', label, key, e && e.message || e); }
+    try { deleteFn(existing[key].id); s.deleted++; }
+    catch (e) {
+      s.failed++;
+      console.error('runSync[%s]: delete failed for key=%s: %s', label, key, e && e.message || e);
+    }
   }
+  return s;
 }
 
 function indexExisting(items, keyFn) {

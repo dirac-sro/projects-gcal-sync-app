@@ -135,6 +135,19 @@ On the personal calendar:
   disappears.
 - Run `runSync()` manually a few times from the editor → no duplicates appear (idempotency).
 - Apps Script editor → *Executions* → confirm no errors and runs complete well under 6 min.
+  Click any `runSync` row to see its log. A healthy steady-state run looks like:
+
+  ```
+  runSync: start mode=solo owner=adam.pagac@alistiq.com horizon=90d
+  runSync: personal scan = 42 events (skipped: 35 free, 0 unanswered/declined, 0 cancelled) → 7 eligible, 9 own segments, 0 shared OOO
+  runSync: existing managed = 9 on own
+  runSync[own]: no changes
+  runSync: done in 1843ms
+  ```
+
+  When something actually changed, the per-target line shows the counts:
+  `runSync[own]: +2 created, ~1 updated, -0 deleted, 0 failed`. The `+/~/-` mapping is
+  *created / updated (hash changed) / deleted (no longer desired)*.
 
 **Team mode only (do once after enabling):**
 
