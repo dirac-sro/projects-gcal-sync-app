@@ -86,6 +86,29 @@ and reconciles the difference: create new, update changed (hash mismatch), delet
 If the target account is on managed Google Workspace, admin policy may restrict parts of this
 setup. See [Step 0](#step-0-verify-workspace-policy) before investing time.
 
+### Source must be a Google Calendar
+
+The sync reads each source via the Google Calendar API (`Calendar.Events.list`), so every entry
+in `PERSONAL_CAL_IDS` must be a **Google Calendar** reachable from the target account through
+Google Calendar sharing. A non-Google personal calendar — **iCloud**, Outlook/Microsoft 365,
+etc. — addressed by its native email **does not work**: the Calendar API cannot read it and
+Google's *Share with specific people* flow only works between Google accounts.
+
+A non-Google calendar can be brought in only by subscribing to its **iCal/`.ics` URL** in Google
+Calendar (*Add calendar → From URL*), which creates a Google-side calendar with its own ID that
+the script can then read. This path is **not recommended** because of three limitations:
+
+1. **Stale data.** Google refreshes URL-subscribed calendars only periodically (often 12–24h),
+   so Busy blocks can lag well behind the real calendar.
+2. **Missing metadata.** The sync depends on each event's `transparency` (busy/free) and the
+   user's `responseStatus` (declined / unanswered are skipped). `.ics` feeds frequently omit
+   these, so filtering becomes unreliable — events may all read as Busy, or be dropped.
+3. **Read-only.** The subscription is one-way, which suits this sync, but the limitations above
+   still apply.
+
+Not handled for now — if a teammate's personal calendar lives on iCloud/Outlook, keep it as (or
+mirror it into) a Google Calendar and share that.
+
 ## Step 0: Verify Workspace policy
 
 Confirm the target account permits all of the following **before** installing:
@@ -276,6 +299,17 @@ All configuration lives in the `CONFIG` block at the top of [`Code.gs`](Code.gs)
 | `BUSY_TITLE`         | `'Personal - Busy'`   | Title for personal-target blocks. Shared title is fixed to `OOO - {name}`.                                                 |
 | `SYNC_EVERY_MINUTES` | `10`                  | Trigger interval. Valid: 1, 5, 10, 15, 30.                                                                                 |
 | `RUN_BUDGET_MS`      | `300000` (5 min)      | Execution budget; bails before hitting the 6-min Apps Script hard limit.                                                   |
+
+### Script Properties (optional web-app onboarding)
+
+The optional self-service onboarding web app ([`WebApp.gs`](WebApp.gs) + [`SetupForm.html`](SetupForm.html))
+reads two deployment-specific values from **Project Settings → Script Properties**, so they stay
+out of source and each deployment configures its own:
+
+| Property       | Purpose                                                                                  |
+|----------------|------------------------------------------------------------------------------------------|
+| `TEAM_CAL_ID`  | Shared team calendar ID for `OOO - {name}` blocks. Unset = team mode has nowhere to write. |
+| `SETUP_URL`    | The deployed web-app `/exec` URL, used in the failure-recovery email link.               |
 
 ## Verifying it works
 
