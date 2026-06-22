@@ -10,7 +10,7 @@
 
 /** ===== CONFIG ===== */
 
-const CONFIG = {
+const DEFAULT_CONFIG = {
   PERSONAL_CAL_IDS:   ['your.personal@gmail.com'], // one or more source calendars shared INTO this account ("See all event details" or "free/busy"). Accepts a single string for back-compat.
   WORK_CAL_ID:        'primary',                   // the work calendar this script account owns
   OWNER_EMAIL:        'your.work@email.com',       // your work email — used as a stable key to tag your managed blocks. Required.
@@ -25,6 +25,30 @@ const CONFIG = {
   RUN_BUDGET_MS:      5 * 60 * 1000,               // leave ~1 min headroom under the 6-min Apps Script hard limit
 };
 
+/** Per-user config: DEFAULT_CONFIG overridden by this user's UserProperties. */
+let CONFIG; // populated by loadConfig() at each entry point
+
+const USER_PROP_KEYS = ['PERSONAL_CAL_IDS', 'SHARED_CAL_ID', 'OWNER_DISPLAY_NAME', 'WORK_START_HOUR', 'WORK_END_HOUR'];
+
+function loadConfig() { CONFIG = mergeUserConfig(DEFAULT_CONFIG); }
+
+function mergeUserConfig(defaults) {
+  const p = PropertiesService.getUserProperties().getProperties();
+  const c = Object.assign({}, defaults);
+  if (p.PERSONAL_CAL_IDS) { try { c.PERSONAL_CAL_IDS = JSON.parse(p.PERSONAL_CAL_IDS); } catch (e) { c.PERSONAL_CAL_IDS = [p.PERSONAL_CAL_IDS]; } }
+  if (p.SHARED_CAL_ID !== undefined && p.SHARED_CAL_ID !== '') c.SHARED_CAL_ID = p.SHARED_CAL_ID;
+  if (p.OWNER_DISPLAY_NAME) c.OWNER_DISPLAY_NAME = p.OWNER_DISPLAY_NAME;
+  if (p.WORK_START_HOUR) c.WORK_START_HOUR = parseInt(p.WORK_START_HOUR, 10);
+  if (p.WORK_END_HOUR) c.WORK_END_HOUR = parseInt(p.WORK_END_HOUR, 10);
+  // Web-app users never type their work email or timezone — derive them.
+  // The DEFAULT_CONFIG placeholder must NOT shadow the session email, or every
+  // web-app user would be tagged 'your.work@email.com'. Treat the placeholder as empty.
+  const cfgEmail = (c.OWNER_EMAIL && c.OWNER_EMAIL !== 'your.work@email.com') ? c.OWNER_EMAIL : '';
+  c.OWNER_EMAIL = p.OWNER_EMAIL || cfgEmail || Session.getActiveUser().getEmail();
+  c.TZ = Session.getScriptTimeZone();
+  return c;
+}
+
 /** ===== ENTRY POINTS ===== */
 
 /**
@@ -37,6 +61,7 @@ const CONFIG = {
  * Re-running is safe and required after toggling team mode on/off or changing OWNER_EMAIL.
  */
 function initialSetup() {
+  loadConfig();
   assertTzMatches();
   if (!CONFIG.OWNER_EMAIL) {
     throw new Error('OWNER_EMAIL is empty — set it to your work email in CONFIG.');
@@ -68,8 +93,10 @@ function initialSetup() {
  * bails before the 6-min Apps Script execution limit and resumes on the next tick.
  */
 function runSync() {
+  loadConfig();
   assertTzMatches();
   if (!CONFIG.OWNER_EMAIL) throw new Error('OWNER_EMAIL is empty. Set it in CONFIG and re-run initialSetup().');
+  try {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(0)) {
     console.log('runSync: skipped — prior run still holding the lock');
@@ -131,9 +158,9 @@ function runSync() {
     const sumOwn = reconcile(
       desiredOwn, existingOwn,
       d => hashOfOwn(d.seg),
-      (d, h) => Calendar.Events.insert(blockBodyOwn(d.seg, d.sourceId, h, ownerEmail), CONFIG.WORK_CAL_ID),
-      (id, d, h) => Calendar.Events.patch(blockBodyOwn(d.seg, d.sourceId, h, ownerEmail), CONFIG.WORK_CAL_ID, id),
-      id => Calendar.Events.remove(CONFIG.WORK_CAL_ID, id),
+      (d, h) => callWithRetry_(() => Calendar.Events.insert(blockBodyOwn(d.seg, d.sourceId, h, ownerEmail), CONFIG.WORK_CAL_ID)),
+      (id, d, h) => callWithRetry_(() => Calendar.Events.patch(blockBodyOwn(d.seg, d.sourceId, h, ownerEmail), CONFIG.WORK_CAL_ID, id)),
+      id => callWithRetry_(() => Calendar.Events.remove(CONFIG.WORK_CAL_ID, id)),
       overBudget, 'own'
     );
     logReconcile('own', sumOwn);
@@ -142,16 +169,72 @@ function runSync() {
       const sumShared = reconcile(
         desiredShared, existingShared,
         d => hashOfShared(d),
-        (d, h) => Calendar.Events.insert(blockBodyShared(d, h, ownerEmail), CONFIG.SHARED_CAL_ID),
-        (id, d, h) => Calendar.Events.patch(blockBodyShared(d, h, ownerEmail), CONFIG.SHARED_CAL_ID, id),
-        id => Calendar.Events.remove(CONFIG.SHARED_CAL_ID, id),
+        (d, h) => callWithRetry_(() => Calendar.Events.insert(blockBodyShared(d, h, ownerEmail), CONFIG.SHARED_CAL_ID)),
+        (id, d, h) => callWithRetry_(() => Calendar.Events.patch(blockBodyShared(d, h, ownerEmail), CONFIG.SHARED_CAL_ID, id)),
+        id => callWithRetry_(() => Calendar.Events.remove(CONFIG.SHARED_CAL_ID, id)),
         overBudget, 'shared'
       );
       logReconcile('shared', sumShared);
     }
+    PropertiesService.getUserProperties().deleteProperty('SYNC_LAST_ALERT_AT'); // success → reset alert throttle
     console.log('runSync: done in %dms', Date.now() - startedAt);
   } finally {
-    lock.releaseLock();
+    try { lock.releaseLock(); } catch (e) { console.warn('runSync: lock release failed (ignored): %s', e && e.message || e); }
+  }
+  } catch (err) {
+    notifyFailure_(err);
+    throw err;
+  }
+}
+
+/**
+ * Best-effort web-app setup URL for the recovery email.
+ *
+ * Reads the Script Property `SETUP_URL` — set this once to the deployed web-app `/exec`
+ * URL (Project Settings → Script Properties). This is REQUIRED for the link to work for
+ * every user: the auto-detect fallback `ScriptApp.getService().getUrl()` returns the
+ * owner-only `/dev` URL when called from a trigger, which does not work for colleagues.
+ * On relocating/redeploying the project, update that one Script Property.
+ */
+function setupUrl_() {
+  try {
+    const p = PropertiesService.getScriptProperties().getProperty('SETUP_URL');
+    if (p) return p;
+  } catch (e) {}
+  try { return ScriptApp.getService().getUrl() || ''; } catch (e) { return ''; }
+}
+
+/**
+ * Email the owner when a scheduled run fails (revoked share, expired auth, quota).
+ * Throttled to at most one alert per 24h per user (single timestamp, no failure counting);
+ * a successful run clears the timestamp so a fresh problem alerts immediately.
+ */
+function notifyFailure_(err) {
+  try {
+    const props = PropertiesService.getUserProperties();
+    const last = parseInt(props.getProperty('SYNC_LAST_ALERT_AT') || '0', 10);
+    if (last && (Date.now() - last) < 24 * 60 * 60 * 1000) {
+      console.log('notifyFailure_: suppressed (last alert %d min ago): %s',
+        Math.round((Date.now() - last) / 60000), (err && err.message) || err);
+      return;
+    }
+    const to = Session.getActiveUser().getEmail();
+    if (!to) return;
+    const url = setupUrl_();
+    const step2 = url
+      ? '2. Otvor setup a klikni „Zapnúť synchronizáciu":\n   ' + url
+      : '2. Otvor svoj gcal-sync setup link a klikni „Zapnúť synchronizáciu".';
+    MailApp.sendEmail(to, 'gcal-sync: synchronizácia zlyhala — treba akciu',
+      'Synchronizácia tvojho kalendára zlyhala a momentálne nebeží.\n\n' +
+      'Čo urobiť:\n' +
+      '1. Over, že tvoj osobný kalendár je stále zdieľaný do tvojho pracovného účtu ' +
+      '(Google Calendar → Settings and sharing → See all event details).\n' +
+      step2 + '\n\n' +
+      'Ak chyba pretrváva, daj vedieť správcovi.\n\n' +
+      'Technický detail: ' + (err && err.stack || err));
+    props.setProperty('SYNC_LAST_ALERT_AT', String(Date.now()));
+  } catch (e) {
+    console.warn('notifyFailure_ could not send mail: %s', e && e.message || e);
   }
 }
 
@@ -399,7 +482,89 @@ function hashOfOwn(seg) { return seg.start.getTime() + '-' + seg.end.getTime(); 
  */
 function hashOfShared(d) { return d.startDate + '|' + d.endDate + '|' + CONFIG.OWNER_DISPLAY_NAME; }
 
+/** ===== TEST HELPERS (run manually from the editor) ===== */
+function assert_(label, cond) {
+  if (!cond) throw new Error('FAIL: ' + label);
+  console.log('PASS: ' + label);
+}
+
+function test_mergeUserConfig() {
+  const props = PropertiesService.getUserProperties();
+  const saved = props.getProperties();
+  try {
+    props.deleteAllProperties();
+    // No user props → defaults, OWNER_EMAIL from session, TZ from script
+    let c = mergeUserConfig(DEFAULT_CONFIG);
+    assert_('default work end is 18', c.WORK_END_HOUR === 18);
+    assert_('OWNER_EMAIL filled from session', !!c.OWNER_EMAIL && c.OWNER_EMAIL.indexOf('@') > 0);
+    assert_('TZ equals script tz', c.TZ === Session.getScriptTimeZone());
+
+    // User props override
+    props.setProperty('PERSONAL_CAL_IDS', JSON.stringify(['a@gmail.com', 'b@gmail.com']));
+    props.setProperty('WORK_END_HOUR', '17');
+    props.setProperty('SHARED_CAL_ID', 'team@group.calendar.google.com');
+    props.setProperty('OWNER_DISPLAY_NAME', 'Jane Doe');
+    c = mergeUserConfig(DEFAULT_CONFIG);
+    assert_('PERSONAL_CAL_IDS parsed from JSON', Array.isArray(c.PERSONAL_CAL_IDS) && c.PERSONAL_CAL_IDS.length === 2);
+    assert_('WORK_END_HOUR overridden to 17', c.WORK_END_HOUR === 17);
+    assert_('SHARED_CAL_ID overridden', c.SHARED_CAL_ID === 'team@group.calendar.google.com');
+    assert_('OWNER_DISPLAY_NAME overridden', c.OWNER_DISPLAY_NAME === 'Jane Doe');
+  } finally {
+    props.deleteAllProperties();
+    if (Object.keys(saved).length) props.setProperties(saved);
+  }
+  console.log('test_mergeUserConfig: ALL PASSED');
+}
+
+function test_notifyFailure_exists() {
+  assert_('notifyFailure_ is a function', typeof notifyFailure_ === 'function');
+  console.log('test_notifyFailure_exists: PASSED');
+}
+
+function test_callWithRetry_() {
+  // Transient error → retried, then succeeds (sleeps ~1s on the single retry).
+  let n = 0;
+  const r = callWithRetry_(() => {
+    n++;
+    if (n < 2) throw new Error("We're sorry, a server error occurred. Please wait a bit and try again.");
+    return 'ok';
+  });
+  assert_('transient retried then succeeded', r === 'ok' && n === 2);
+
+  // Non-transient (404) → thrown immediately, no retry.
+  let m = 0, threw = false;
+  try { callWithRetry_(() => { m++; throw new Error('Not Found (404)'); }); }
+  catch (e) { threw = true; }
+  assert_('404 fails fast without retry', threw && m === 1);
+
+  console.log('test_callWithRetry_: ALL PASSED');
+}
+
 /** ===== API + DATE HELPERS ===== */
+
+/**
+ * Call a Google API function with bounded retry on TRANSIENT errors only (5xx, rate limit,
+ * "We're sorry, a server error occurred … try again"). Non-transient errors (404 not-found,
+ * 403 no-access) throw immediately — retrying won't fix an unshared calendar. A transient
+ * that recovers within the attempts is logged at WARNING (visible in Cloud Logging) and does
+ * NOT alert; a transient that survives all attempts is rethrown as a real failure.
+ */
+function callWithRetry_(fn) {
+  const MAX_TRIES = 4;
+  let delay = 1000; // backoff: 1s → 2s → 4s
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return fn();
+    } catch (e) {
+      const msg = ((e && e.message) || e) + '';
+      const transient = /server error|try again|rate limit|user rate|backend|internal error|timeout|temporarily|\b50[023]\b|\b429\b/i.test(msg);
+      if (!transient || attempt >= MAX_TRIES) throw e;
+      console.warn('callWithRetry_: transient error (attempt %d/%d), retry in %dms: %s', attempt, MAX_TRIES, delay, msg);
+      Utilities.sleep(delay);
+      delay *= 2;
+    }
+  }
+}
 
 /**
  * Paginating wrapper around Calendar.Events.list. Always expands recurring events into
@@ -421,7 +586,7 @@ function listEvents(calId, timeMin, timeMax, privateExtProps) {
       pageToken,
     };
     if (privateExtProps && privateExtProps.length) params.privateExtendedProperty = privateExtProps;
-    const resp = Calendar.Events.list(calId, params);
+    const resp = callWithRetry_(() => Calendar.Events.list(calId, params));
     (resp.items || []).forEach(i => out.push(i));
     pageToken = resp.nextPageToken;
   } while (pageToken);
@@ -433,3 +598,137 @@ function parseYmd(s) { const p = s.split('-'); return new Date(+p[0], +p[1] - 1,
 
 /** Format a Date as YYYY-MM-DD in CONFIG.TZ. */
 function fmtDate(d) { return Utilities.formatDate(d, CONFIG.TZ, 'yyyy-MM-dd'); }
+
+/** ===== WEB APP (onboarding) ===== */
+
+// Team calendar that receives the shared "OOO - <name>" all-day blocks. Kept OUT of source
+// so the repo stays generic: set it per-deployment as a Script Property
+// (Project Settings → Script Properties → key `TEAM_CAL_ID`, value = the calendar's ID).
+// Empty when unset — team mode then has nowhere to write and stays effectively off.
+const TEAM_CAL_ID = PropertiesService.getScriptProperties().getProperty('TEAM_CAL_ID') || '';
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('SetupForm')
+    .setTitle('gcal-sync — setup')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/** Current per-user settings used to prefill the form. */
+function getCurrentSettings() {
+  const c = mergeUserConfig(DEFAULT_CONFIG);
+  const ids = Array.isArray(c.PERSONAL_CAL_IDS) ? c.PERSONAL_CAL_IDS.filter(s => s && s.indexOf('@') > 0 && s !== 'your.personal@gmail.com') : [];
+  return {
+    email: c.OWNER_EMAIL,
+    personalCalIds: ids,
+    displayName: c.OWNER_DISPLAY_NAME && c.OWNER_DISPLAY_NAME !== 'YOUR NAME' ? c.OWNER_DISPLAY_NAME : '',
+    sharedCalId: c.SHARED_CAL_ID || '',
+    workStartHour: c.WORK_START_HOUR,
+    workEndHour: c.WORK_END_HOUR,
+    teamModeOn: !!c.SHARED_CAL_ID,
+    teamCalId: TEAM_CAL_ID,
+  };
+}
+
+function test_getCurrentSettings() {
+  const s = getCurrentSettings();
+  assert_('email present', !!s.email && s.email.indexOf('@') > 0);
+  assert_('personalCalIds is array', Array.isArray(s.personalCalIds));
+  assert_('workStartHour numeric', typeof s.workStartHour === 'number');
+  assert_('teamModeOn boolean', typeof s.teamModeOn === 'boolean');
+  console.log('test_getCurrentSettings: ALL PASSED');
+}
+
+/** True if the current user can list events on calId (i.e. it's shared in). */
+function canReadCalendar_(calId) {
+  try {
+    Calendar.Events.list(calId, { maxResults: 1, timeMin: new Date().toISOString() });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Form submit handler. Validates, stores per-user config, installs trigger, runs first sync. */
+function saveSetup(data) {
+  // Accept the new array form; fall back to the legacy scalar personalCalId.
+  const rawIds = Array.isArray(data.personalCalIds)
+    ? data.personalCalIds
+    : (data.personalCalId ? [data.personalCalId] : []);
+  // Trim, drop blanks/non-emails, dedupe — preserving order.
+  const calIds = [];
+  rawIds.forEach(s => {
+    const v = (s || '').trim();
+    if (v && v.indexOf('@') > 0 && calIds.indexOf(v) < 0) calIds.push(v);
+  });
+  if (calIds.length === 0) {
+    return { ok: false, message: 'Zadaj aspoň jeden osobný kalendár (Gmail adresu).' };
+  }
+  if (data.teamMode && !(data.displayName || '').trim()) {
+    return { ok: false, message: 'Pri tímovom režime vyplň svoje meno (pre „OOO - Meno").' };
+  }
+  if (!Number.isInteger(data.workStartHour) || !Number.isInteger(data.workEndHour) ||
+      data.workStartHour < 0 || data.workEndHour > 24 || data.workStartHour >= data.workEndHour) {
+    return { ok: false, message: 'Neplatné pracovné hodiny — zadaj celé čísla 0–24, kde „od" < „do".' };
+  }
+  const unreadable = calIds.filter(id => !canReadCalendar_(id));
+  if (unreadable.length) {
+    const me = Session.getActiveUser().getEmail();
+    return { ok: false, message:
+      'Tieto kalendáre zatiaľ nevidím (nie sú mi nazdieľané):\n\n' +
+      unreadable.map(id => '  • ' + id).join('\n') + '\n\n' +
+      'Pre každý z nich:\n' +
+      '1. Prihlás sa do daného účtu → Google Calendar → Settings and sharing.\n' +
+      '2. Share with specific people → pridaj ' + me + ' s právom „See all event details".\n' +
+      '3. Potom klikni Zapnúť synchronizáciu znova.' };
+  }
+
+  const props = PropertiesService.getUserProperties();
+  props.setProperties({
+    PERSONAL_CAL_IDS: JSON.stringify(calIds),
+    WORK_START_HOUR: String(data.workStartHour),
+    WORK_END_HOUR: String(data.workEndHour),
+    SHARED_CAL_ID: data.teamMode ? TEAM_CAL_ID : '',
+    OWNER_DISPLAY_NAME: data.teamMode ? data.displayName.trim() : '',
+  });
+
+  // (Re)install this user's time trigger.
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runSync')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  loadConfig();
+  ScriptApp.newTrigger('runSync').timeBased().everyMinutes(CONFIG.SYNC_EVERY_MINUTES).create();
+
+  runSync();
+  return { ok: true, message: '✅ Hotovo! Synchronizácia beží každých ' + CONFIG.SYNC_EVERY_MINUTES +
+    ' minút. Skontroluj pracovný kalendár o pár minút.' };
+}
+
+function test_saveSetup_validation() {
+  // Empty personal calendar → not ok, no trigger installed
+  let r = saveSetup({ personalCalId: '', workStartHour: 8, workEndHour: 18, teamMode: false, displayName: '', sharedCalId: '' });
+  assert_('empty calendar rejected', r.ok === false);
+  assert_('mentions calendar', /kalend/i.test(r.message));
+
+  // Team mode without name → rejected
+  r = saveSetup({ personalCalId: 'x@gmail.com', workStartHour: 8, workEndHour: 18, teamMode: true, displayName: '', sharedCalId: TEAM_CAL_ID });
+  assert_('team mode needs name', r.ok === false && /meno/i.test(r.message));
+
+  // Invalid work hours → rejected
+  r = saveSetup({ personalCalId: 'x@gmail.com', workStartHour: NaN, workEndHour: 18, teamMode: false, displayName: '', sharedCalId: '' });
+  assert_('invalid work hours rejected', r.ok === false && /hodin/i.test(r.message));
+
+  // Array form: empty array rejected, message mentions calendar.
+  r = saveSetup({ personalCalIds: [], workStartHour: 8, workEndHour: 18, teamMode: false, displayName: '', sharedCalId: '' });
+  assert_('empty array rejected', r.ok === false && /kalend/i.test(r.message));
+
+  // Array form: multiple unreadable calendars → all-or-nothing reject naming EACH.
+  r = saveSetup({ personalCalIds: ['a@gmail.com', 'b@gmail.com'], workStartHour: 8, workEndHour: 18, teamMode: false, displayName: '', sharedCalId: '' });
+  assert_('multi-cal unreadable rejected', r.ok === false);
+  assert_('names every failing calendar', /a@gmail\.com/.test(r.message) && /b@gmail\.com/.test(r.message));
+
+  // Back-compat: scalar personalCalId still accepted as a single source.
+  r = saveSetup({ personalCalId: 'c@gmail.com', workStartHour: 8, workEndHour: 18, teamMode: false, displayName: '', sharedCalId: '' });
+  assert_('scalar back-compat rejected at readability not shape', r.ok === false && /nevid/i.test(r.message));
+
+  console.log('test_saveSetup_validation: ALL PASSED');
+}
