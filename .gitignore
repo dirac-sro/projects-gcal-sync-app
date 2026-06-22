@@ -1,6 +1,7 @@
 # Deployment-specific / local — never commit (clasp link, credentials)
 .clasp.json
 .clasprc.json
+.claspignore
 
 # Superpowers scratch / planning workspace (local only)
 .superpowers/
