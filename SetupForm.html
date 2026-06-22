@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: -apple-system, Roboto, Arial, sans-serif; max-width: 520px; margin: 24px auto; padding: 0 16px; color: #202124; }
+    h1 { font-size: 20px; } label { display:block; margin:14px 0 4px; font-weight:600; }
+    input[type=text], input[type=number] { width:100%; padding:8px; border:1px solid #dadce0; border-radius:8px; box-sizing:border-box; }
+    .row { display:flex; gap:12px; } .row > div { flex:1; }
+    .hint { color:#5f6368; font-size:13px; margin-top:4px; }
+    .calRow { display:flex; gap:8px; align-items:center; margin-top:8px; }
+    .calRow input { flex:1; }
+    .calRow button.rm { margin:0; padding:8px 12px; background:#f1f3f4; color:#5f6368; font-size:16px; line-height:1; }
+    #addCal { margin-top:8px; padding:6px 12px; background:#e8f0fe; color:#1a73e8; font-size:14px; }
+    button { margin-top:20px; padding:10px 18px; border:0; border-radius:8px; background:#1a73e8; color:#fff; font-size:15px; cursor:pointer; }
+    button:disabled { background:#9aa0a6; cursor:default; }
+    #status { margin-top:16px; padding:12px; border-radius:8px; white-space:pre-wrap; display:none; }
+    .ok { background:#e6f4ea; color:#137333; } .err { background:#fce8e6; color:#c5221f; }
+    a { color:#1a73e8; }
+  </style>
+</head>
+<body>
+  <h1>Zapnúť synchronizáciu kalendára</h1>
+  <p class="hint">Tvoje súkromné „busy" udalosti sa zobrazia ako anonymné <b>Personal - Busy</b> bloky na tvojom pracovnom kalendári počas pracovných hodín.</p>
+
+  <label>Tvoje osobné kalendáre (Gmail adresy)</label>
+  <div id="calRows"></div>
+  <button type="button" id="addCal" onclick="addRow('')">+ Pridať ďalší kalendár</button>
+  <div class="hint">Každý kalendár najprv nazdieľaj na <b id="ownerEmail"></b> s právom „See all event details".</div>
+
+  <div class="row">
+    <div><label>Pracovné hodiny od</label><input type="number" id="workStart" min="0" max="23" value="8"></div>
+    <div><label>do</label><input type="number" id="workEnd" min="1" max="24" value="18"></div>
+  </div>
+
+  <label><input type="checkbox" id="teamMode"> Zapísať dovolenky na tímový kalendár (OOO)</label>
+  <div id="teamFields" style="display:none">
+    <label>Tvoje meno (zobrazí sa ako „OOO - Meno")</label>
+    <input type="text" id="displayName" placeholder="Jane Doe">
+  </div>
+
+  <button id="go" onclick="submitForm()">Zapnúť synchronizáciu</button>
+  <div id="status"></div>
+
+<script>
+  let TEAM_CAL_ID = '';
+  function show(cls, msg) { var s=document.getElementById('status'); s.className=cls; s.style.display='block'; s.innerHTML=msg; }
+  function addRow(value) {
+    var wrap = document.createElement('div');
+    wrap.className = 'calRow';
+    var inp = document.createElement('input');
+    inp.type = 'text'; inp.placeholder = 'ty@gmail.com'; inp.value = value || '';
+    var rm = document.createElement('button');
+    rm.type = 'button'; rm.className = 'rm'; rm.textContent = '×';
+    rm.onclick = function(){ removeRow(wrap); };
+    wrap.appendChild(inp); wrap.appendChild(rm);
+    document.getElementById('calRows').appendChild(wrap);
+  }
+  function removeRow(wrap) {
+    var rows = document.querySelectorAll('#calRows .calRow');
+    if (rows.length <= 1) { wrap.querySelector('input').value = ''; return; } // keep at least one row
+    wrap.parentNode.removeChild(wrap);
+  }
+  google.script.run.withSuccessHandler(function(s){
+    TEAM_CAL_ID = s.teamCalId;
+    document.getElementById('ownerEmail').textContent = s.email;
+    var ids = (s.personalCalIds && s.personalCalIds.length) ? s.personalCalIds : [''];
+    ids.forEach(function(id){ addRow(id); });
+    document.getElementById('workStart').value = s.workStartHour;
+    document.getElementById('workEnd').value = s.workEndHour;
+    document.getElementById('teamMode').checked = s.teamModeOn;
+    document.getElementById('displayName').value = s.displayName;
+    toggleTeam();
+  }).getCurrentSettings();
+
+  document.getElementById('teamMode').addEventListener('change', toggleTeam);
+  function toggleTeam(){ document.getElementById('teamFields').style.display = document.getElementById('teamMode').checked ? 'block':'none'; }
+
+  function submitForm() {
+    var btn=document.getElementById('go'); btn.disabled=true;
+    show('', 'Pracujem…');
+    var ids = [];
+    document.querySelectorAll('#calRows input').forEach(function(inp){
+      var v = inp.value.trim();
+      if (v && ids.indexOf(v) < 0) ids.push(v);
+    });
+    var data = {
+      personalCalIds: ids,
+      workStartHour: parseInt(document.getElementById('workStart').value,10),
+      workEndHour: parseInt(document.getElementById('workEnd').value,10),
+      teamMode: document.getElementById('teamMode').checked,
+      displayName: document.getElementById('displayName').value.trim(),
+      sharedCalId: document.getElementById('teamMode').checked ? TEAM_CAL_ID : ''
+    };
+    google.script.run
+      .withSuccessHandler(function(r){ btn.disabled=false; show(r.ok?'ok':'err', r.message); })
+      .withFailureHandler(function(e){ btn.disabled=false; show('err', 'Chyba: '+e.message); })
+      .saveSetup(data);
+  }
+</script>
+</body>
+</html>
