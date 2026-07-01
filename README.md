@@ -183,10 +183,11 @@ Editor → *Services* (`+` icon, left rail) → enable **Calendar API (v3)**.
 
 ### 4. Configure
 
-In `Code.gs`, edit the `CONFIG` block at the top of the file:
+In `Code.gs`, edit the `DEFAULT_CONFIG` block at the top of the file (when the onboarding web app
+is used, each user's own values override these defaults via their `UserProperties`):
 
 ```javascript
-const CONFIG = {
+const DEFAULT_CONFIG = {
   PERSONAL_CAL_IDS:   ['<source-calendar-id>'],  // one or more sources from step 1
   WORK_CAL_ID:        'primary',                  // target calendar; usually 'primary'
   OWNER_EMAIL:        '<target-account-email>',   // used to tag managed blocks. Required.
@@ -283,7 +284,10 @@ pass into the past or you remove them by hand once.
 
 ## Configuration reference
 
-All configuration lives in the `CONFIG` block at the top of [`Code.gs`](Code.gs).
+All configuration lives in the `DEFAULT_CONFIG` block at the top of [`Code.gs`](Code.gs). When the
+onboarding web app is used, each user's values (source calendars, display name, work hours) override
+these defaults via their `UserProperties`; `OWNER_EMAIL` and `TZ` are auto-derived from the running
+user's session.
 
 | Constant             | Default               | Notes                                                                                                                      |
 |----------------------|-----------------------|----------------------------------------------------------------------------------------------------------------------------|
@@ -302,7 +306,7 @@ All configuration lives in the `CONFIG` block at the top of [`Code.gs`](Code.gs)
 
 ### Script Properties (optional web-app onboarding)
 
-The optional self-service onboarding web app ([`WebApp.gs`](WebApp.gs) + [`SetupForm.html`](SetupForm.html))
+The optional self-service onboarding web app (`doGet`/`saveSetup` in [`Code.gs`](Code.gs) + [`SetupForm.html`](SetupForm.html))
 reads two deployment-specific values from **Project Settings → Script Properties**, so they stay
 out of source and each deployment configures its own:
 
