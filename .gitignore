@@ -1,0 +1,11 @@
+# Deployment-specific / local — never commit (clasp link, credentials)
+.clasp.json
+.clasprc.json
+.claspignore
+
+# Superpowers scratch / planning workspace (local only)
+.superpowers/
+
+# Internal planning & decision docs — kept locally, not published
+docs/setup-automation-decision.md
+docs/superpowers/
